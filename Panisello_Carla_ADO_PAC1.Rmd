@@ -1,0 +1,223 @@
+---
+title: "Anàlisi de dades òmiques (ADO)"
+subtitle: "Prova d'avaluació continuada 1 (PAC1)"
+author: "Carla Panisello Aranda"
+email: "cpaniselloa@uoc.edu"
+output:
+  word_document:
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r, load packages, message=FALSE}
+# Carreguem llibrerias
+library(ggplot2)
+library(reshape2)
+library(SummarizedExperiment) 
+library(ggfortify)
+library(DESeq2)
+library(limma)
+library(EnhancedVolcano)
+library(ComplexHeatmap)
+```
+
+
+# Preparació entorn de treball
+```{r}
+# Primer de tot descarreguem les dades del fitxer de GitHub
+url_cachexia <- "https://github.com/nutrimetabolomics/metaboData/raw/main/Datasets/2024-Cachexia/human_cachexia.csv"
+download.file(url_cachexia, destfile = "human_cachexia.csv")
+cachexia_data <- read.csv("human_cachexia.csv",check.names = FALSE)
+
+str(cachexia_data) # Dades ben carregades
+
+# Mirem si hi ha valors NA (descripció indica que no, però comprovem)
+sum(is.na(cachexia_data))  
+```
+Observem al fer estudi previ de les dades, que hi ha un total de 77 pacients no aparellats, i que en total tenim 2 grups amb pèrdua muscular: cachexia i control. Per altra banda, la resta d'elements descrits, son tots valors numèrics de la quantitat de metabòlit que es troba en cada pacient o control. Aquests paràmetres son els que caldrà estudiar per saber quins metabòlits tenen alguna relació amb la cachexia. Observem també que no hi ha cap valor NA.
+
+# Creació de l'objecte `SummarizedExperiment` 
+
+```{r}
+# Convertim la taula a matriu i eliminem les dues primeres columnes que no contenen elements numèrics. Transposem la matriu per tal de tenir les mostres com columnes i els metabolits com a files. 
+cachexia_assay <- as.matrix(t(cachexia_data[, -c(1:2)])) 
+
+# Seguidament definim les matrius de dades i metadades del dataset.
+colnames(cachexia_assay) <- cachexia_data$`Patient ID`  
+rownames(cachexia_assay) <- colnames(cachexia_data[, -c(1:2)])
+cachexia_metadata <- cachexia_data[, c("Patient ID", "Muscle loss")] 
+rownames(cachexia_metadata) <- cachexia_metadata$`Patient ID`
+
+# Creem l'objecte Summarized Experiment.
+cachexia_se <- SummarizedExperiment(assays = list(counts = cachexia_assay), colData = cachexia_metadata)
+cachexia_se
+```
+
+Observem que després de fer els passos addients i obtenir les dades per columnes i files, obtenim un objecte de tipus `SummarizedExperiment` que té 63 files i 77 columnes corresponents a cada pacient.
+
+
+# Exploració i control de calitat de les dades
+Aquest pas és important per assegurar-nos que tot està correctament per poder procedir amb l'anàlisis de les dades.
+
+```{r, fig.width= 10}
+data_long <- reshape2::melt(assay(cachexia_se)) # Cal canviar-ho per poder emprar ggplot2.
+
+# Boxplot per veure distribuciço de metabòlits per pacient sense normalitzar.
+ggplot(data_long, aes(x=Var2, y=value))+
+  geom_boxplot() + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45, size = 6)) +
+  xlab("Pacient ID") + ylab("Concentració metabòlits") + ggtitle("Boxplot concentració metabòlits per pacient (no normalitzat)")
+
+# Histograma per veure la distribució de freqüències a nivell d'expressió dels metabòlits sense normalitzar.
+ggplot(data_long, aes(x =value )) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") + 
+  theme_minimal() +
+  xlab("Valors") + 
+  ylab("Freqüència") + 
+  ggtitle("Histogram freqüència concentracions metabòlits (no normalitzat)")
+```
+
+Observem en el Boxplot la distribució de les dades, i podem veure que existeix variabilitat entre els diferents pacients. En l'histograma observem una distribució altament assimètrica del nivell de metabòlits, amb la majoria de valors concentrats a l'interval més baixi. Això indica que les dades estan bastant esbiaixades, i que per tant, hi ha valors propers a 0 i outliers. Per aquest motiu, caldrà realitzar una normalització de les dades.
+
+També es poden fer altres estudis, com ara l'agrupació jerarquica i estudi per PCAs. Aquest tipus d'estudi ens permet determinar la distància que existeix entre mostres.
+
+```{r, fig.width=8, fig.height=7}
+ # Realitzem agrupació jerarquica
+dist_matrix <- dist(t(assay(cachexia_se)), method = "euclidean")  
+hc_cachexia <- hclust(dist_matrix, method = "complete")  
+plot(hc_cachexia, main = "Dendrograma de les mostres (no normalitzat)", xlab = "", sub = "",cex=0.7)
+
+# Anàlisis per components principals (PCA)
+expression_data_cachexia <- assay(cachexia_se)
+pca_cachexia <- prcomp(t(expression_data_cachexia), scale = TRUE) 
+pca_df <- data.frame(pca_cachexia$x)  
+group <- colData(cachexia_se)$"Muscle loss"  
+
+pca_meta <- as.data.frame(colData(cachexia_se))
+autoplot(pca_cachexia, data = pca_meta, colour = "Muscle.loss", label = TRUE, label.size = 3) + theme_minimal()
+
+```
+
+Observem la distribució segons la distribució jeràrquica i també per PCAs. Observem que no hi ha una tendència clara i diferències en metabòlits entre els grups de cachexia i els controls. Probablement les dades son diferents i la informació es troba esbiaixada, per aquest motiu, serà necessari realitzar una normalització de les dades.
+
+# Normalització dades (logarítmica)
+Al tenir unes dades que segueixen una distribució amb gran variabilitat, aplicar una transformació del tipus logarítmica pot ser d'utilitat. Tot i que hi ha altres mètodes, en el nostre cas farem servir aquest tipus de normalització.
+
+```{r}
+# Normalització logarítmica
+expression_data_cachexia <- assay(cachexia_se) # Extreiem les dades que es troben en SummarizedExperiment de cachexia.
+cachexia_se_log  <-  log2(expression_data_cachexia + 1) 
+head(cachexia_se_log) 
+```
+
+# Control de qualitat després de la normalització (logarítmica)
+Cal comprovar que ara els gràfics surten millor per poder seguir fent els anàlisis.
+
+```{r, fig.width=10}
+data_long_log <- reshape2::melt(cachexia_se_log) # Cal canviar-ho per poder emprar ggplot2.
+
+# Boxplot per veure distribuciço de metabòlits per pacient (normalització log).
+ggplot(data_long_log, aes(x=Var2, y=value))+
+  geom_boxplot() + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45, size = 6)) +
+  xlab("Pacient ID") + ylab("Concentració metabòlits") + ggtitle("Boxplot concentració metabòlits per pacient (normalització log)")
+
+# Histograma per veure la distribució de freqüències a nivell d'expressió dels metabòlits (normalització log).
+ggplot(data_long_log, aes(x =value )) +
+  geom_histogram(binwidth = 0.2, fill = "steelblue", color = "black") + 
+  theme_minimal() +
+  xlab("Valors") + 
+  ylab("Freqüència") + 
+  ggtitle("Histogram freqüència concentracions metabòlits (normalització log)")
+```
+Observem que conseguim una millor distribució de les mostres utilitzant aquest tipus de normalització. Son més homogènies. Podem seguir indagant en l'estructura mitjançant l'agrupació jerarquica i l'anàlisis de PCA.
+
+```{r, fig.width=8, fig.height=7}
+ # Realitzem agrupació jerarquica
+dist_matrix_log <- dist(t(cachexia_se_log), method = "euclidean")  
+hc_cachexia_log <- hclust(dist_matrix_log, method = "complete")  
+plot(hc_cachexia_log, main = "Dendrograma de les mostres (normalització log)", xlab = "", sub = "",cex=0.7)
+
+# Anàlisis per components principals (PCA)
+expression_data_cachexia_log <- cachexia_se_log
+pca_cachexia_log <- prcomp(t(expression_data_cachexia_log), scale = TRUE) # Fiquem la transposada.
+
+autoplot(pca_cachexia_log, data = pca_meta, colour = "Muscle.loss", label = TRUE, label.size = 3) + theme_minimal()
+
+```
+Observem que en tots els casos, es troba distribuït d'una forma més homogènia per tots els gràfics realitzats durant el control. 
+
+Al realitzar la normalització logarítmica, el que ens permet és tenir unes dades amb asimetria reduïda i amb control dels valors extrems, i a més a més. Això és útil perquè ens permet comparar patrons d'expressió de metabòlits, fer anàlisis multivariants (PCA, clustering) i fer tests estadístics. Per tant, a partir d'ara, els anàlisis que es realitzaran, seran amb aquestes mostres normalitzades.
+
+# Anàlisis de metabòlits diferencials
+Aquests anàlisis ens permeten veure quines diferències hi ha entre els grups de cachexia i els grups control. Ho farem amb el paquet de `limma`de Bioconductor.
+
+```{r}
+# Fem que el paràmetre diferencial sigui el grup de pèrdua muscular.
+exp_cachexia <- model.matrix(~ 0 + factor(colData(cachexia_se)$`Muscle loss`)) 
+colnames(exp_cachexia) <- c("Control", "Cachexia") 
+
+# Realitzem la prova diferencial amb limma
+fit <- lmFit(cachexia_se_log, exp_cachexia)
+fit2 <- eBayes(fit)  
+results_limma <- topTable(fit2, coef = "Cachexia", number = Inf) # Volem veure aquells que tenen un valor p significatiu.
+head(results_limma)
+```
+
+Inicialment observem que els 6 primers metabòlits que sembla que mostren diferències serien Creatinina, Citrat, Hippurat, Dimethylamina i Glycine. Podem seguir explorant amb altres tipus d'anàlisis com veurem a continuació. De fet, per poder-ho veure de forma més visual, es poden realitzar Volcano plots o bé Heatmaps. Ho fem a continuació.
+
+```{r,fig.height=8, fig.width=10}
+# Fem un Volcano plot i visualitzem quins metabòlits presenten diferències.
+EnhancedVolcano(results_limma, 
+                lab = rownames(results_limma),
+                x = 'logFC', 
+                y = 'adj.P.Val', 
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                title = 'Volcano Plot Metabòlits Diferencials',
+                colAlpha = 0.4,
+                legendLabels = c('NS', 'LogFC', 'p-value', 'Significant'),
+                legendPosition = 'top')
+```
+Observem que els que sembla que tinguin una p significativa son els que surten remarcats en color vermell. Veiem alguns exemples escrits, com ara Creatinina (vista anteriorment), citrat, taurina, fumarat, etc.
+
+També podem veure, concretament, si aquests elements que presenten diferències en l'expressió es situen més en pacients amb cachexia o bé en els controls.
+
+Una altra manera de mirar perfils d'expressió és mitjançant la realització d'un Heatmap, com veiem a continuació.
+
+```{r, fig.width= 8, fig.height=8}
+# Heatmap Control vs Cachexia
+ha = HeatmapAnnotation(Condition = cachexia_data$`Muscle loss`,
+                       col = list(Condition = c("cachexic" = "#ACE1AF", "control" ="#C3B091")))
+Heatmap(cachexia_se_log,top_annotation = ha, cluster_columns = FALSE,row_names_gp = gpar(fontsize = 7), column_names_gp = gpar(fontsize = 7))
+```
+
+Podem mirar si realitzant boxplots on es compari expressió de cada metabòlit en funció del grup de pacients. Com tenim 63 metabòlits, el que farem serà representar aquells que presenten diferències més grans (Top5) que hem obtingut amb Limma.
+
+```{r}
+# Boxplot TOP 5 metabòlits
+cachexia_sig<- melt(cachexia_se_log)
+
+cachexia_sig_meta <- merge(cachexia_sig,cachexia_data[,c(1,2)], by.x="Var2", by.y="Patient ID")
+
+sig_metabolites <- rownames(results_limma[order(results_limma$adj.P.Val),])[1:5]
+
+ggplot(cachexia_sig_meta[cachexia_sig_meta$Var1 %in% sig_metabolites,], aes(x= `Muscle loss`, y=value, fill=`Muscle loss`)) + geom_boxplot() + scale_fill_manual(values = c("cachexic" = "#ACE1AF", "control" ="#C3B091"))+ theme_minimal() + facet_wrap(~Var1,scales="free")
+```
+També es pot realitzar un Boxplot general per confirmar que en general hi ha més metabòlits en orina en els pacients amb caquèxia en comparaicó amb els grups control.
+
+```{r}
+# Boxplot General
+ggplot(cachexia_sig_meta, aes(x= `Muscle loss`, y=value, fill=`Muscle loss`)) + geom_boxplot() + scale_fill_manual(values = c("cachexic" = "#ACE1AF", "control" ="#C3B091")) + theme_minimal()
+```
+
+# Guardar l'objecte de treball
+
+```{r}
+saveRDS(cachexia_se, "cachexia_se.rds")
+```
+
+
